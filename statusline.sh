@@ -4,6 +4,7 @@
 #
 # Shows: model, context window, git branch, thinking indicator,
 #        5-hour + 7-day rate limit bars with reset countdowns.
+# Handles OAuth token refresh on 401 and falls back to stale cache.
 
 set -uo pipefail
 
@@ -53,44 +54,96 @@ format_k() {
 CTX_USED_K=$(format_k "$CTX_USED")
 CTX_SIZE_K=$(format_k "$CTX_SIZE")
 
-# ── Usage API (cached 60s) ─────────────────────────────────────────────
+# ── Usage API (cached 120s) ────────────────────────────────────────────
 CACHE_FILE="/tmp/claude-statusline-usage.json"
-CACHE_TTL=60
+CACHE_TTL=120
 USAGE_JSON=""
 
-fetch_usage() {
-  local token
+get_access_token() {
   # macOS: read from Keychain
   if command -v security &>/dev/null; then
-    token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | jq -r '.claudeAiOauth.accessToken' 2>/dev/null) || true
+    security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+      | jq -r '.claudeAiOauth.accessToken' 2>/dev/null
+    return
   fi
   # Linux fallback: read from credentials file
-  if [[ -z "${token:-}" || "${token:-}" == "null" ]] && [[ -f "$HOME/.claude/.credentials.json" ]]; then
-    token=$(jq -r '.claudeAiOauth.accessToken' "$HOME/.claude/.credentials.json" 2>/dev/null) || true
+  if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+    jq -r '.claudeAiOauth.accessToken' "$HOME/.claude/.credentials.json" 2>/dev/null
   fi
-  [[ -z "${token:-}" || "${token:-}" == "null" ]] && return 1
+}
+
+refresh_token() {
+  local refresh
+  if command -v security &>/dev/null; then
+    refresh=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
+      | jq -r '.claudeAiOauth.refreshToken' 2>/dev/null) || return 1
+  elif [[ -f "$HOME/.claude/.credentials.json" ]]; then
+    refresh=$(jq -r '.claudeAiOauth.refreshToken' "$HOME/.claude/.credentials.json" 2>/dev/null) || return 1
+  fi
+  [[ -z "$refresh" || "$refresh" == "null" ]] && return 1
 
   local resp
-  resp=$(curl -s --max-time 5 \
+  resp=$(curl -s --max-time 5 -X POST \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh\"}" \
+    "https://console.anthropic.com/v1/oauth/token" 2>/dev/null) || return 1
+
+  local new_token
+  new_token=$(echo "$resp" | jq -r '.access_token // empty' 2>/dev/null)
+  [[ -z "$new_token" ]] && return 1
+  echo "$new_token"
+}
+
+try_fetch_with_token() {
+  local token=$1
+  [[ -z "$token" || "$token" == "null" ]] && return 1
+
+  local response http_code body
+  response=$(curl -s --max-time 5 -w '\n%{http_code}' \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
     -H "Accept: application/json" \
     "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || return 1
 
-  # Validate it's JSON
-  echo "$resp" | jq empty 2>/dev/null || return 1
-  echo "$resp" > "$CACHE_FILE"
-  echo "$resp"
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+
+  if [[ "$http_code" == "200" ]]; then
+    echo "$body" | jq -e '.five_hour' >/dev/null 2>&1 || return 1
+    echo "$body" > "$CACHE_FILE"
+    echo "$body"
+    return 0
+  fi
+
+  # Return special exit code 2 for 401 (token expired)
+  [[ "$http_code" == "401" ]] && return 2
+  return 1
+}
+
+fetch_usage() {
+  local token
+  token=$(get_access_token) || return 1
+
+  try_fetch_with_token "$token"
+  local rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    return 0
+  elif [[ $rc -eq 2 ]]; then
+    # Token expired — attempt refresh and retry
+    local new_token
+    new_token=$(refresh_token) || return 1
+    try_fetch_with_token "$new_token"
+    return $?
+  fi
+
+  return 1
 }
 
 # Check cache
 if [[ -f "$CACHE_FILE" ]]; then
-  # macOS stat uses -f %m, Linux stat uses -c %Y
-  if stat -f %m "$CACHE_FILE" &>/dev/null; then
-    CACHE_AGE=$(( $(date +%s) - $(stat -f %m "$CACHE_FILE") ))
-  else
-    CACHE_AGE=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE") ))
-  fi
+  CACHE_AGE=$(( $(date +%s) - $(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) ))
   if (( CACHE_AGE < CACHE_TTL )); then
     USAGE_JSON=$(cat "$CACHE_FILE" 2>/dev/null)
   fi
@@ -99,6 +152,11 @@ fi
 # Fetch if no cache
 if [[ -z "$USAGE_JSON" ]]; then
   USAGE_JSON=$(fetch_usage 2>/dev/null) || USAGE_JSON=""
+fi
+
+# Stale cache fallback — show old data rather than nothing
+if [[ -z "$USAGE_JSON" && -f "$CACHE_FILE" ]]; then
+  USAGE_JSON=$(cat "$CACHE_FILE" 2>/dev/null)
 fi
 
 # ── Parse usage data ───────────────────────────────────────────────────
